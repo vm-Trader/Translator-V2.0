@@ -1,6 +1,6 @@
 export async function onRequestPost({ request, env }) {
   try {
-    // ✅ check for key here
+    // ✅ Only check inside the function
     if (!env.GEMINI_API_KEY) {
       return new Response("API key missing in environment", { status: 500 });
     }
@@ -47,6 +47,7 @@ Return ONLY:
       }
     };
 
+    // ✅ Use the stable latest Pro model
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent?key=${env.GEMINI_API_KEY}`;
 
     const resp = await fetch(url, {
@@ -70,3 +71,4 @@ Return ONLY:
     return new Response("Internal error: " + err.message, { status: 500 });
   }
 }
+
