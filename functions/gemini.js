@@ -1,3 +1,8 @@
+if (!env.GEMINI_API_KEY) {
+  return new Response("API key missing in environment", { status: 500 });
+}
+
+
 export async function onRequestPost({ request, env }) {
   try {
     const { text } = await request.json();
