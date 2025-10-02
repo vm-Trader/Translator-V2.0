@@ -49,8 +49,8 @@
   <!-- Header -->
   <header class="bg-white border-b border-slate-200 p-3 flex justify-between items-center">
     <div class="flex items-center gap-2">
-      <span id="status-dot" class="w-3 h-3 rounded-full bg-green-500"></span>
-      <span id="status-text" class="text-sm text-slate-500">Working</span>
+      <span id="status-dot" class="w-3 h-3 rounded-full bg-yellow-400"></span>
+      <span id="status-text" class="text-sm text-slate-500">Checking...</span>
     </div>
     <div class="font-semibold text-slate-800">Translator by VM</div>
     <button id="new-btn" class="text-sm text-blue-600 hover:underline">New</button>
@@ -150,6 +150,35 @@
       addBubble("assistant", "", "Could not connect. Please try again.");
     }
   }
+
+  // Status check for Gemini connectivity
+  async function checkStatus() {
+    const statusDot = document.getElementById("status-dot");
+    const statusText = document.getElementById("status-text");
+
+    statusDot.className = "w-3 h-3 rounded-full bg-yellow-400";
+    statusText.textContent = "Checking...";
+
+    try {
+      const res = await fetch("/api/gemini", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "ping" })
+      });
+      if (res.ok) {
+        statusDot.className = "w-3 h-3 rounded-full bg-green-500";
+        statusText.textContent = "Working";
+      } else {
+        throw new Error("Bad response");
+      }
+    } catch {
+      statusDot.className = "w-3 h-3 rounded-full bg-red-500";
+      statusText.textContent = "Error";
+    }
+  }
+
+  // Run status check on page load
+  checkStatus();
 </script>
 </body>
 </html>
