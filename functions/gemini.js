@@ -42,7 +42,9 @@ Return ONLY:
       }
     };
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${env.GEMINI_API_KEY}`;
+    // ✅ Use the latest stable model
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent?key=${env.GEMINI_API_KEY}`;
+
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -50,11 +52,16 @@ Return ONLY:
     });
 
     if (!resp.ok) return new Response("Gemini API error", { status: 500 });
+
     const result = await resp.json();
     const jsonString = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
     if (!jsonString) return new Response("Invalid response", { status: 500 });
 
-    return new Response(jsonString, { headers: { "Content-Type": "application/json" } });
+    return new Response(jsonString, {
+      headers: { "Content-Type": "application/json" }
+    });
+
   } catch (err) {
     return new Response("Internal error: " + err.message, { status: 500 });
   }
