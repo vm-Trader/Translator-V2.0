@@ -1,35 +1,35 @@
 // L1
-export async function onRequestPost({ request, env }) {                        // L2
-  const origin = request.headers.get("Origin") || "";                         // L3
-  const host = request.headers.get("Host") || "";                             // L4
+export async function onRequestPost({ request, env }) {
+  // L2
+  const origin = request.headers.get("Origin") || "";
+  const host = request.headers.get("Host") || "";
 
-  // ✅ Auto-Allow Production + Previews                                          L5
+  // L5
   const allowOrigin =
-    origin === `https://${host}` ||                                            // L6
-    origin.endsWith(".translator-v2-0.pages.dev") ||                           // L7
-    origin === "https://translator-v2-0.pages.dev";                            // L8
+    origin === `https://${host}` ||
+    origin.endsWith(".translator-v2-0.pages.dev") ||
+    origin === "https://translator-v2-0.pages.dev";
 
   const corsHeaders = {
-    "Access-Control-Allow-Origin": allowOrigin ? origin : "",                 // L10
+    "Access-Control-Allow-Origin": allowOrigin ? origin : "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Vary": "Origin"
   };
 
-  // Handle OPTIONS (preflight)                                                  L15
+  // L15
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders });         // L17
+    return new Response(null, { status: 204, headers: corsHeaders });
   }
 
   if (request.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
       status: 405,
-      headers: corsHeaders                                                     // L22
+      headers: corsHeaders
     });
   }
 
-  // ✅ Content-Type check                                                       L25
-  const ct = (request.headers.get("Content-Type") || "").toLowerCase();       // L26
+  const ct = (request.headers.get("Content-Type") || "").toLowerCase();
   if (!ct.includes("application/json")) {
     return new Response(JSON.stringify({ error: "Unsupported Media Type" }), {
       status: 415,
@@ -37,17 +37,17 @@ export async function onRequestPost({ request, env }) {                        /
     });
   }
 
+  // L30
   let body;
   try {
-    body = await request.json();                                              // L34
-  } catch {
-    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+    body = await request.json();
+  } catch (err) {
+    return new Response(JSON.stringify({ error: "Invalid JSON", message: err.message }), {
       status: 400,
       headers: corsHeaders
     });
   }
 
-  // ✅ Strict input enforcement + sanitization                                  L40
   const rawText = (body?.text ?? "").toString();
   if (!rawText.trim()) {
     return new Response(JSON.stringify({ error: "Missing text" }), {
@@ -55,10 +55,7 @@ export async function onRequestPost({ request, env }) {                        /
     });
   }
 
-  const cleanText = rawText
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, " ")
-    .trim();                                                                  // L50
+  const cleanText = rawText.trim(); // Preserve characters, remove only whitespace
 
   if (cleanText.length > 2000) {
     return new Response(JSON.stringify({ error: "Text too long" }), {
@@ -66,32 +63,53 @@ export async function onRequestPost({ request, env }) {                        /
     });
   }
 
-  // ✅ API key check                                                            L56
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) {
-    return new Response(JSON.stringify({ error: "Server misconfigured" }), {
+    return new Response(JSON.stringify({ error: "Server misconfigured: API key missing" }), {
       status: 500, headers: corsHeaders
     });
   }
 
-  // ✅ Gemini Payload                                                           L62
-  const system = [
-    "You are a bilingual assistant for English and Vietnamese.",
-    "Return a JSON object with: inputLanguage, improved, translation.",
-    "improved = same-language polished version.",
-    "translation = other language (EN↔VI)."
-  ].join(" ");
+  // L54
+  const systemPrompt = `
+You are a multilingual assistant with a strict translation workflow.
+
+🔹 RULES
+- Analyze input carefully (especially Vietnamese context).
+- Improve text into a clear, natural version with correct grammar.
+- Keep language plain, semi-formal, natural. Avoid idioms or robotic tone.
+- Break long sentences into 2–3 shorter ones while preserving meaning.
+
+🔹 WORKFLOW
+- If Vietnamese → improved Vietnamese + English translation.
+- If English → improved English + Vietnamese translation.
+- If Hinglish (Hindi in Roman script) → improved English + Vietnamese translation.
+
+🔹 JSON OUTPUT
+Return ONLY:
+{
+  "inputLanguage": "English" | "Vietnamese" | "Hinglish",
+  "improved": "<Improved version>",
+  "translation": "<Translation into target language>"
+}
+  `.trim();
 
   const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: `${system}\n\nTEXT:\n${cleanText}` }]
+    contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nUser message: "${cleanText}"` }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          inputLanguage: { type: "STRING" },
+          improved: { type: "STRING" },
+          translation: { type: "STRING" }
+        },
+        required: ["inputLanguage", "improved", "translation"]
       }
-    ]
+    }
   };
 
-  // ✅ Gemini call with timeout                                                 L74
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort("timeout"), 10000);
 
@@ -107,7 +125,7 @@ export async function onRequestPost({ request, env }) {                        /
       }
     );
   } catch (err) {
-    return new Response(JSON.stringify({ error: "Upstream failure" }), {
+    return new Response(JSON.stringify({ error: "Upstream failure", message: err.message }), {
       status: 502, headers: corsHeaders
     });
   } finally {
@@ -116,10 +134,11 @@ export async function onRequestPost({ request, env }) {                        /
 
   if (!result.ok) {
     const errText = await result.text();
-    console.warn(JSON.stringify({ status: result.status, error: errText.slice(0, 300) }));
-    return new Response(JSON.stringify({ error: "Upstream error" }), {
-      status: 502, headers: corsHeaders
-    });
+    return new Response(JSON.stringify({
+      error: "Upstream error",
+      status: result.status,
+      body: errText.slice(0, 500)
+    }), { status: 502, headers: corsHeaders });
   }
 
   let parsed;
@@ -127,21 +146,12 @@ export async function onRequestPost({ request, env }) {                        /
     const raw = await result.json();
     const out = raw?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     parsed = JSON.parse(out);
-  } catch {
+  } catch (err) {
     parsed = { inputLanguage: "Unknown", improved: "", translation: "" };
   }
 
-  const safe = {
-    inputLanguage: String(parsed.inputLanguage || "Unknown"),
-    improved: String(parsed.improved || ""),
-    translation: String(parsed.translation || "")
-  };
-
-  return new Response(JSON.stringify(safe), {
+  return new Response(JSON.stringify(parsed), {
     status: 200,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json"
-    }
+    headers: { ...corsHeaders, "Content-Type": "application/json" }
   });
 }
