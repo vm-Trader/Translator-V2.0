@@ -17,7 +17,8 @@ const FETCH_TIMEOUT_MS = 10_000;
 const RATE_LIMIT = { capacity: 20, refillPerMinute: 12 };
 
 const GEMINI_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent";
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent";
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // Globals
