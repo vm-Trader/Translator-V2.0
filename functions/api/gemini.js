@@ -1,157 +1,115 @@
-// L1
-export async function onRequestPost({ request, env }) {
-  // L2
-  const origin = request.headers.get("Origin") || "";
-  const host = request.headers.get("Host") || "";
+// /functions/gemini.js
+export const onRequestPost = async ({ request }) => {
+  const PRIMARY_MODEL = "gemini-2.5-flash-preview-05-20";
+  const FALLBACK_MODEL = "gemini-1.5-flash";
 
-  // L5
-  const allowOrigin =
-    origin === `https://${host}` ||
-    origin.endsWith(".translator-v2-0.pages.dev") ||
-    origin === "https://translator-v2-0.pages.dev";
+  const API_URL = (model) =>
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
 
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": allowOrigin ? origin : "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Vary": "Origin"
-  };
+  const API_KEY = "AIzaSyDEzX8QpqzThzO3hmBYVLAh_w2nVyRhcrI"; // DO NOT expose in frontend!
 
-  // L15
-  if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: corsHeaders });
-  }
+  const HEADERS = { "Content-Type": "application/json" };
 
-  if (request.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
-      status: 405,
-      headers: corsHeaders
-    });
-  }
-
-  const ct = (request.headers.get("Content-Type") || "").toLowerCase();
-  if (!ct.includes("application/json")) {
-    return new Response(JSON.stringify({ error: "Unsupported Media Type" }), {
-      status: 415,
-      headers: corsHeaders
-    });
-  }
-
-  // L30
-  let body;
-  try {
-    body = await request.json();
-  } catch (err) {
-    return new Response(JSON.stringify({ error: "Invalid JSON", message: err.message }), {
-      status: 400,
-      headers: corsHeaders
-    });
-  }
-
-  const rawText = (body?.text ?? "").toString();
-  if (!rawText.trim()) {
-    return new Response(JSON.stringify({ error: "Missing text" }), {
-      status: 400, headers: corsHeaders
-    });
-  }
-
-  const cleanText = rawText.trim(); // Preserve characters, remove only whitespace
-
-  if (cleanText.length > 2000) {
-    return new Response(JSON.stringify({ error: "Text too long" }), {
-      status: 413, headers: corsHeaders
-    });
-  }
-
-  const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return new Response(JSON.stringify({ error: "Server misconfigured: API key missing" }), {
-      status: 500, headers: corsHeaders
-    });
-  }
-
-  // L54
   const systemPrompt = `
-You are a multilingual assistant with a strict translation workflow.
+You are a Vietnamese-English communication assistant.
+Your job is to polish broken or awkward English into fluent, polite workplace English.
+Then, translate that polished sentence into **natural, respectful Vietnamese** using the following cultural rules:
 
-🔹 RULES
-- Analyze input carefully (especially Vietnamese context).
-- Improve text into a clear, natural version with correct grammar.
-- Keep language plain, semi-formal, natural. Avoid idioms or robotic tone.
-- Break long sentences into 2–3 shorter ones while preserving meaning.
+1. Use correct personal pronouns: anh, chị, em, cô, chú, etc.
+2. Add politeness particles like "ạ", "dạ", or "vui lòng" when appropriate.
+3. Add "ơi" after name-based salutations (e.g., "Chị Lan ơi").
+4. Use Vietnamese indirect tone (avoid sounding robotic/direct).
+5. Return only JSON with this schema:
 
-🔹 WORKFLOW
-- If Vietnamese → improved Vietnamese + English translation.
-- If English → improved English + Vietnamese translation.
-- If Hinglish (Hindi in Roman script) → improved English + Vietnamese translation.
-
-🔹 JSON OUTPUT
-Return ONLY:
 {
-  "inputLanguage": "English" | "Vietnamese" | "Hinglish",
-  "improved": "<Improved version>",
-  "translation": "<Translation into target language>"
+  "polishedEnglish": "...",
+  "vietnamesePolished": "..."
 }
-  `.trim();
 
-  const payload = {
-    contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nUser message: "${cleanText}"` }] }],
-    generationConfig: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: "OBJECT",
-        properties: {
-          inputLanguage: { type: "STRING" },
-          improved: { type: "STRING" },
-          translation: { type: "STRING" }
-        },
-        required: ["inputLanguage", "improved", "translation"]
-      }
+DO NOT include explanations or formatting. Only return clean JSON.`.trim();
+
+  // JSON schema for enforcement
+  const schema = {
+    responseMimeType: "application/json",
+    responseSchema: {
+      type: "OBJECT",
+      properties: {
+        polishedEnglish: { type: "STRING" },
+        vietnamesePolished: { type: "STRING" }
+      },
+      required: ["polishedEnglish", "vietnamesePolished"]
     }
   };
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("timeout"), 10000);
-
-  let result;
-  try {
-    result = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify(payload)
-      }
-    );
-  } catch (err) {
-    return new Response(JSON.stringify({ error: "Upstream failure", message: err.message }), {
-      status: 502, headers: corsHeaders
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  if (!result.ok) {
-    const errText = await result.text();
-    return new Response(JSON.stringify({
-      error: "Upstream error",
-      status: result.status,
-      body: errText.slice(0, 500)
-    }), { status: 502, headers: corsHeaders });
-  }
-
-  let parsed;
-  try {
-    const raw = await result.json();
-    const out = raw?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    parsed = JSON.parse(out);
-  } catch (err) {
-    parsed = { inputLanguage: "Unknown", improved: "", translation: "" };
-  }
-
-  return new Response(JSON.stringify(parsed), {
-    status: 200,
-    headers: { ...corsHeaders, "Content-Type": "application/json" }
+  const makePayload = (text) => ({
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ parts: [{ text }] }],
+    generationConfig: schema
   });
-}
+
+  // Core fetch wrapper with timeout
+  async function fetchWithTimeout(model, payload, timeout = 8000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+
+    try {
+      const res = await fetch(API_URL(model), {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(id);
+      if (!res.ok) throw new Error(`Gemini ${model} responded with ${res.status}`);
+      const data = await res.json();
+      const jsonText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!jsonText) throw new Error("Invalid Gemini response structure");
+      return JSON.parse(jsonText);
+    } catch (err) {
+      return { error: true, model, message: err.message };
+    }
+  }
+
+  // Main entry
+  try {
+    const input = await request.json();
+    if (!input?.text || typeof input.text !== "string") {
+      return new Response(
+        JSON.stringify({ error: "Missing or invalid 'text' field" }),
+        { status: 400 }
+      );
+    }
+
+    const payload = makePayload(input.text.trim());
+
+    let result = await fetchWithTimeout(PRIMARY_MODEL, payload);
+
+    // Fallback if primary fails
+    if (result?.error) {
+      console.warn(`⚠️ Primary model failed: ${result.message}`);
+      result = await fetchWithTimeout(FALLBACK_MODEL, payload);
+    }
+
+    if (result?.error) {
+      return new Response(
+        JSON.stringify({ error: "Upstream failure", message: result.message }),
+        { status: 502 }
+      );
+    }
+
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "https://translator-v2-0.pages.dev",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+      }
+    });
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: "Server error", message: err.message }),
+      { status: 500 }
+    );
+  }
+};
