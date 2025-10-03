@@ -205,10 +205,18 @@ export const onRequestPost = async (context) => {
   }
 
   if (!upstream.ok) {
-    console.warn(JSON.stringify({ level: "warn", event: "upstream_bad_status", requestId, status: upstream.status }));
-    return json({ error: ERROR_MAP.UPSTREAM_ERROR.code, message: ERROR_MAP.UPSTREAM_ERROR.msg, requestId },
-      { status: 502, headers: corsHeaders });
-  }
+  const errText = await upstream.text().catch(() => "");
+  console.warn(JSON.stringify({
+    level: "warn",
+    event: "upstream_bad_status",
+    requestId,
+    status: upstream.status,
+    body: errText.slice(0, 300) // log first 300 chars safely
+  }));
+  return json({ error: ERROR_MAP.UPSTREAM_ERROR.code, message: ERROR_MAP.UPSTREAM_ERROR.msg, requestId },
+    { status: 502, headers: corsHeaders });
+}
+
 
   let data = {};
   try {
