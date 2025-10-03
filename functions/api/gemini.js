@@ -1,11 +1,7 @@
 // ======================================================================
-//  Cloudflare Pages Function  –  Gemini ETA Translator
-//  Path:  /functions/api/gemini.js
-//  Features:
-//    – multi-language polish + translate (user chooses target)
-//    – 4-model fallback chain (latest → stable → flash → pro)
-//    – strict JSON schema OR graceful degrade
-//    – full CORS, 10 s timeout, input sanitised, no hard-coded key
+//  Cloudflare Pages Function – Gemini ETA Translator
+//  Priority:  highest-free-tier → lowest-free-tier → paid
+//  Models chosen from Google Cloud **live** list (v1 first, v1beta last)
 // ======================================================================
 export async function onRequestPost({ request, env }) {
   /* -------------------- 0.  CORS + method -------------------- */
@@ -39,7 +35,9 @@ export async function onRequestPost({ request, env }) {
   const rawText = (body?.text ?? "").toString().trim();
   if (!rawText) return jsonRsp({ error: "Missing text" }, { status: 400 });
   if (rawText.length > 2000) return jsonRsp({ error: "Text too long" }, { status: 413 });
-  const targetLang = (body?.target ?? "en").toLowerCase().trim();   // NEW: user picks target
+
+  const targetLang = (body?.target ?? "vi").toLowerCase().trim(); // default Vietnamese
+  const sourceLang = (body?.source ?? "auto").toLowerCase().trim(); // default auto-detect
 
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) return jsonRsp({ error: "Server misconfigured" }, { status: 500 });
@@ -47,10 +45,8 @@ export async function onRequestPost({ request, env }) {
   /* -------------------- 2.  prompt -------------------- */
   const systemPrompt = `
 You are an ETA (Easy-Translate-All) assistant.
-You support every language that Gemini can detect.
-
 Rules:
-- Detect the input language (ISO-639-1).
+- Detect the input language (ISO-639-1) unless source is given.
 - Polish grammar/style in the SAME language.
 - Translate the polished text into the TARGET language requested.
 - Keep tone plain, semi-formal, natural.
@@ -63,16 +59,16 @@ Rules:
 }
 `.trim();
 
-  /* -------------------- 3.  fallback model chain -------------------- */
+  /* -------------------- 3.  MODEL PRIORITY – highest free tier first -------------------- */
   const MODELS = [
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-flash-latest",
-    "gemini-pro-latest"
+    "gemini-1.5-flash",               // v1 – unlimited daily tokens, 250 req/day, 10 req/min
+    "gemini-pro",                     // v1 – 50 req/day, 3 M tokens/day, warm cluster
+    "gemini-1.5-pro",                 // v1beta – bigger context, lower quota
+    "gemini-2.5-flash-preview-05-20"  // v1beta – newest, but experimental & slower
   ];
 
   const payloadBase = {
-    contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nTARGET: ${targetLang}\n\nTEXT: "${rawText}"` }] }],
+    contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nSOURCE: ${sourceLang}\nTARGET: ${targetLang}\n\nTEXT: "${rawText}"` }] }],
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -87,10 +83,10 @@ Rules:
     }
   };
 
-  /* ---------- 4.  fetch wrapper with timeout ---------- */
+  /* ---------- 4.  fetch wrapper – 30 s timeout ---------- */
   async function tryModel(model) {
     const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), 10000);
+    const id = setTimeout(() => controller.abort(), 30000);
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
@@ -101,10 +97,10 @@ Rules:
       const data = await res.json();
       const txt = data?.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!txt) throw new Error(`${model} → empty text`);
-      return JSON.parse(txt);          // may throw
+      return JSON.parse(txt);
     } catch (e) {
       console.warn(`[Gemini ${model}]`, e.message);
-      return null;                       // caller will try next
+      return null;
     } finally {
       clearTimeout(id);
     }
@@ -121,7 +117,6 @@ Rules:
   if (!result) {
     return jsonRsp({ error: "All Gemini models failed or returned invalid JSON" }, { status: 502 });
   }
-  // ensure shape even if Gemini skipped a field
   const safe = {
     inputLanguage: String(result.inputLanguage || "Unknown"),
     improved: String(result.improved || ""),
