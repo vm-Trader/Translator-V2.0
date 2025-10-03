@@ -6,7 +6,7 @@
 // Config (edit safely)
 ///////////////////////////////////////////////////////////////////////////////
 const ORIGIN_ALLOW = [
-  "https://translator-vm.pages.dev",   // production site
+  "https://translator-v2-0.pages.dev/",   // production site
   "http://localhost:8788"              // local preview/dev
 ];
 
