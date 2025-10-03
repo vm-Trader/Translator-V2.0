@@ -1,252 +1,147 @@
-// functions/api/gemini.js
-// Cloudflare Pages Function — Guardian-ready (corrected payload)
+// L1
+export async function onRequestPost({ request, env }) {                        // L2
+  const origin = request.headers.get("Origin") || "";                         // L3
+  const host = request.headers.get("Host") || "";                             // L4
 
-///////////////////////////////////////////////////////////////////////////////
-// Config
-///////////////////////////////////////////////////////////////////////////////
-const ORIGIN_ALLOW = [
-  "https://translator-vm.pages.dev",    // production domain
-  "https://translator-v2-0.pages.dev",  // add your actual CF Pages domain here
-  "http://localhost:8788"               // local preview
-];
+  // ✅ Auto-Allow Production + Previews                                          L5
+  const allowOrigin =
+    origin === `https://${host}` ||                                            // L6
+    origin.endsWith(".translator-v2-0.pages.dev") ||                           // L7
+    origin === "https://translator-v2-0.pages.dev";                            // L8
 
-const MAX_CHARS = 2000;
-const FETCH_TIMEOUT_MS = 10_000;
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": allowOrigin ? origin : "",                 // L10
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Vary": "Origin"
+  };
 
-// Simple token bucket (per IP)
-const RATE_LIMIT = { capacity: 20, refillPerMinute: 12 };
-
-const GEMINI_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent";
-
-
-///////////////////////////////////////////////////////////////////////////////
-// Globals
-///////////////////////////////////////////////////////////////////////////////
-const ipBuckets = new Map();
-
-///////////////////////////////////////////////////////////////////////////////
-// Utilities
-///////////////////////////////////////////////////////////////////////////////
-const ERROR_MAP = {
-  METHOD_NOT_ALLOWED: { code: "METHOD_NOT_ALLOWED", status: 405, msg: "Method not allowed" },
-  CORS_DENIED:        { code: "CORS_DENIED",        status: 403, msg: "CORS origin denied" },
-  BAD_JSON:           { code: "BAD_JSON",           status: 400, msg: "Invalid JSON body" },
-  BAD_CONTENT_TYPE:   { code: "BAD_CONTENT_TYPE",   status: 415, msg: "Unsupported Media Type" },
-  MISSING_TEXT:       { code: "MISSING_TEXT",       status: 400, msg: 'Missing "text" field' },
-  TEXT_TOO_LONG:      { code: "TEXT_TOO_LONG",      status: 413, msg: `Text too long (>${MAX_CHARS})` },
-  INVALID_TEXT:       { code: "INVALID_TEXT",       status: 400, msg: "Invalid text content" },
-  NOT_CONFIGURED:     { code: "NOT_CONFIGURED",     status: 500, msg: "Server not configured" },
-  RATE_LIMITED:       { code: "RATE_LIMITED",       status: 429, msg: "Too many requests" },
-  UPSTREAM_ERROR:     { code: "UPSTREAM_ERROR",     status: 502, msg: "Upstream error" },
-  INTERNAL_ERROR:     { code: "INTERNAL_ERROR",     status: 500, msg: "Unexpected server error" },
-};
-
-function json(body, { status = 200, headers = {} } = {}) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...headers },
-  });
-}
-
-function getClientIp(req) {
-  return (
-    req.headers.get("CF-Connecting-IP") ||
-    (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
-    "0.0.0.0"
-  );
-}
-
-function rateLimit(ip) {
-  const now = Date.now();
-  let bucket = ipBuckets.get(ip);
-  if (!bucket) {
-    bucket = { tokens: RATE_LIMIT.capacity, lastRefillMs: now };
-    ipBuckets.set(ip, bucket);
-  }
-  const elapsedMin = (now - bucket.lastRefillMs) / 60_000;
-  const refill = Math.floor(elapsedMin * RATE_LIMIT.refillPerMinute);
-  if (refill > 0) {
-    bucket.tokens = Math.min(RATE_LIMIT.capacity, bucket.tokens + refill);
-    bucket.lastRefillMs = now;
-  }
-  if (bucket.tokens <= 0) return false;
-  bucket.tokens -= 1;
-  return true;
-}
-
-function corsCheckAndHeaders(request) {
-  const origin = request.headers.get("Origin") || "";
-  if (!origin) return { ok: true, origin: null, headers: {} };
-  if (!ORIGIN_ALLOW.includes(origin)) return { ok: false, origin, headers: {} };
-  return { ok: true, origin, headers: { "Access-Control-Allow-Origin": origin, Vary: "Origin" } };
-}
-
-function sanitizeUserText(raw) {
-  if (typeof raw !== "string") return "";
-  return raw
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, " ")
-    .trim();
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Functions
-///////////////////////////////////////////////////////////////////////////////
-export const onRequestOptions = ({ request }) => {
-  const { ok, origin, headers } = corsCheckAndHeaders(request);
-  if (!ok) {
-    return json({ error: ERROR_MAP.CORS_DENIED.code, message: ERROR_MAP.CORS_DENIED.msg }, { status: 403 });
-  }
-  return new Response(null, {
-    status: 204,
-    headers: {
-      ...(origin ? headers : {}),
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Request-ID",
-      Vary: origin ? "Origin" : "",
-    },
-  });
-};
-
-export const onRequestPost = async (context) => {
-  const { request, env } = context;
-  const requestId = crypto.randomUUID();
-
-  // CORS
-  const { ok: corsOK, origin, headers: corsHeaders } = corsCheckAndHeaders(request);
-  if (!corsOK) {
-    return json({ error: ERROR_MAP.CORS_DENIED.code, message: ERROR_MAP.CORS_DENIED.msg, requestId }, { status: 403 });
+  // Handle OPTIONS (preflight)                                                  L15
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: corsHeaders });         // L17
   }
 
   if (request.method !== "POST") {
-    return json({ error: ERROR_MAP.METHOD_NOT_ALLOWED.code, message: ERROR_MAP.METHOD_NOT_ALLOWED.msg, requestId },
-      { status: 405, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Method Not Allowed" }), {
+      status: 405,
+      headers: corsHeaders                                                     // L22
+    });
   }
 
-  const ip = getClientIp(request);
-  if (!rateLimit(ip)) {
-    console.warn(JSON.stringify({ level: "warn", event: "rate_limited", ip, requestId }));
-    return json({ error: ERROR_MAP.RATE_LIMITED.code, message: ERROR_MAP.RATE_LIMITED.msg, requestId },
-      { status: 429, headers: corsHeaders });
-  }
-
-  const ct = (request.headers.get("Content-Type") || "").toLowerCase();
+  // ✅ Content-Type check                                                       L25
+  const ct = (request.headers.get("Content-Type") || "").toLowerCase();       // L26
   if (!ct.includes("application/json")) {
-    return json({ error: ERROR_MAP.BAD_CONTENT_TYPE.code, message: ERROR_MAP.BAD_CONTENT_TYPE.msg, requestId },
-      { status: 415, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Unsupported Media Type" }), {
+      status: 415,
+      headers: corsHeaders
+    });
   }
 
   let body;
   try {
-    body = await request.json();
+    body = await request.json();                                              // L34
   } catch {
-    return json({ error: ERROR_MAP.BAD_JSON.code, message: ERROR_MAP.BAD_JSON.msg, requestId },
-      { status: 400, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: corsHeaders
+    });
   }
 
-  const textRaw = (body?.text ?? "").toString();
-  if (!textRaw) {
-    return json({ error: ERROR_MAP.MISSING_TEXT.code, message: ERROR_MAP.MISSING_TEXT.msg, requestId },
-      { status: 400, headers: corsHeaders });
-  }
-  if (textRaw.length > MAX_CHARS * 2) {
-    return json({ error: ERROR_MAP.TEXT_TOO_LONG.code, message: ERROR_MAP.TEXT_TOO_LONG.msg, requestId },
-      { status: 413, headers: corsHeaders });
+  // ✅ Strict input enforcement + sanitization                                  L40
+  const rawText = (body?.text ?? "").toString();
+  if (!rawText.trim()) {
+    return new Response(JSON.stringify({ error: "Missing text" }), {
+      status: 400, headers: corsHeaders
+    });
   }
 
-  const text = sanitizeUserText(textRaw);
-  if (!text || text.length > MAX_CHARS) {
-    return json({ error: ERROR_MAP.INVALID_TEXT.code, message: ERROR_MAP.INVALID_TEXT.msg, requestId },
-      { status: 400, headers: corsHeaders });
+  const cleanText = rawText
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\p{P}\p{Zs}]/gu, " ")
+    .trim();                                                                  // L50
+
+  if (cleanText.length > 2000) {
+    return new Response(JSON.stringify({ error: "Text too long" }), {
+      status: 413, headers: corsHeaders
+    });
   }
 
+  // ✅ API key check                                                            L56
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) {
-    return json({ error: ERROR_MAP.NOT_CONFIGURED.code, message: ERROR_MAP.NOT_CONFIGURED.msg, requestId },
-      { status: 500, headers: corsHeaders });
+    return new Response(JSON.stringify({ error: "Server misconfigured" }), {
+      status: 500, headers: corsHeaders
+    });
   }
 
-  // ✅ Corrected payload: one user message (avoids 502 upstream error)
+  // ✅ Gemini Payload                                                           L62
   const system = [
     "You are a bilingual assistant for English and Vietnamese.",
-    "Return a JSON object with keys: inputLanguage, improved, translation.",
-    "improved = polished rewrite in the same language.",
-    "translation = translation into the other language (EN↔VI).",
-    "No code fences. No extra commentary."
+    "Return a JSON object with: inputLanguage, improved, translation.",
+    "improved = same-language polished version.",
+    "translation = other language (EN↔VI)."
   ].join(" ");
 
   const payload = {
     contents: [
       {
         role: "user",
-        parts: [{ text: `${system}\n\nTEXT:\n${text}` }]
+        parts: [{ text: `${system}\n\nTEXT:\n${cleanText}` }]
       }
     ]
   };
 
+  // ✅ Gemini call with timeout                                                 L74
   const controller = new AbortController();
-  const to = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort("timeout"), 10000);
 
-  let upstream;
+  let result;
   try {
-    upstream = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(apiKey)}`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    result = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-latest:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify(payload)
+      }
+    );
+  } catch (err) {
+    return new Response(JSON.stringify({ error: "Upstream failure" }), {
+      status: 502, headers: corsHeaders
     });
-  } catch (e) {
-    clearTimeout(to);
-    console.error(JSON.stringify({ level: "error", event: "upstream_fetch_fail", requestId, msg: String(e?.message || e) }));
-    return json({ error: ERROR_MAP.UPSTREAM_ERROR.code, message: ERROR_MAP.UPSTREAM_ERROR.msg, requestId },
-      { status: 502, headers: corsHeaders });
   } finally {
-    clearTimeout(to);
+    clearTimeout(timeout);
   }
 
-  if (!upstream.ok) {
-  const errText = await upstream.text().catch(() => "");
-  console.warn(JSON.stringify({
-    level: "warn",
-    event: "upstream_bad_status",
-    requestId,
-    status: upstream.status,
-    body: errText.slice(0, 300) // log first 300 chars safely
-  }));
-  return json({ error: ERROR_MAP.UPSTREAM_ERROR.code, message: ERROR_MAP.UPSTREAM_ERROR.msg, requestId },
-    { status: 502, headers: corsHeaders });
-}
-
-
-  let data = {};
-  try {
-    data = await upstream.json();
-  } catch {
-    return json({ error: ERROR_MAP.UPSTREAM_ERROR.code, message: ERROR_MAP.UPSTREAM_ERROR.msg, requestId },
-      { status: 502, headers: corsHeaders });
+  if (!result.ok) {
+    const errText = await result.text();
+    console.warn(JSON.stringify({ status: result.status, error: errText.slice(0, 300) }));
+    return new Response(JSON.stringify({ error: "Upstream error" }), {
+      status: 502, headers: corsHeaders
+    });
   }
 
-  const textOut = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
   let parsed;
-  try { parsed = JSON.parse(textOut); } 
-  catch { parsed = { inputLanguage: "Unknown", improved: textOut || "", translation: "" }; }
+  try {
+    const raw = await result.json();
+    const out = raw?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    parsed = JSON.parse(out);
+  } catch {
+    parsed = { inputLanguage: "Unknown", improved: "", translation: "" };
+  }
 
   const safe = {
     inputLanguage: String(parsed.inputLanguage || "Unknown"),
     improved: String(parsed.improved || ""),
-    translation: String(parsed.translation || ""),
-    requestId,
+    translation: String(parsed.translation || "")
   };
 
-  console.info(JSON.stringify({
-    level: "info",
-    event: "translate_ok",
-    requestId,
-    ip,
-    in_len: text.length,
-    out_len: safe.improved.length + safe.translation.length,
-  }));
-
-  return json(safe, { status: 200, headers: corsHeaders });
-};
+  return new Response(JSON.stringify(safe), {
+    status: 200,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json"
+    }
+  });
+}
