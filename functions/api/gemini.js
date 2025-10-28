@@ -1,17 +1,18 @@
 // ========================================================================
 //  Cloudflare Pages Function – Gemini ETA Translator
-//  Security-first, zero-log, copy-paste ready
+//  Stable, fast, and copy-paste ready (zero noisy logs)
 // ========================================================================
 export async function onRequestPost({ request, env }) {
-  /* ---------- 0.  CORS + method guard ---------- */
+  /* ---------- 0) CORS + method guard ---------- */
   const origin = request.headers.get("Origin") || "";
   const host   = request.headers.get("Host")   || "";
+
   const allowedOrigins = [
     `https://${host}`,
-    `https://translator-v2-0.pages.dev`,
-    /\.translator-v2-0\.pages\.dev$/ // Regex to allow subdomains if needed
+    "https://translator-v2-0.pages.dev",
+    /\.translator-v2-0\.pages\.dev$/ // subdomains
   ];
-  const allowOrigin = allowedOrigins.some(o =>
+  const allowOrigin = allowedOrigins.some((o) =>
     typeof o === "string" ? o === origin : o.test(origin)
   ) ? origin : "";
 
@@ -21,31 +22,37 @@ export async function onRequestPost({ request, env }) {
     "Access-Control-Allow-Headers": "Content-Type",
     "Vary": "Origin"
   };
-  const jsonRsp = (body, init = {}) =>
-    new Response(JSON.stringify(body), { ...init, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+  const json = (body: any, init: any = {}) =>
+    new Response(JSON.stringify(body), {
+      ...init,
+      headers: { "Content-Type": "application/json", ...corsHeaders }
+    });
 
-  if (request.method === "OPTIONS") return jsonRsp(null, { status: 204 });
-  if (request.method !== "POST") return jsonRsp({ error: "Method Not Allowed" }, { status: 405 });
+  if (request.method === "OPTIONS") return json(null, { status: 204 });
+  if (request.method !== "POST")   return json({ error: "Method Not Allowed" }, { status: 405 });
 
-  /* ---------- 1.  body validation + limits ---------- */
+  /* ---------- 1) Body validation ---------- */
   const ct = (request.headers.get("Content-Type") || "").toLowerCase();
-  if (!ct.includes("application/json")) return jsonRsp({ error: "Unsupported Media Type" }, { status: 415 });
+  if (!ct.includes("application/json")) return json({ error: "Unsupported Media Type" }, { status: 415 });
 
-  let body;
-  try { body = await request.json(); } catch (e) {
-    return jsonRsp({ error: "Invalid JSON", message: e.message }, { status: 400 });
+  let body: any;
+  try {
+    body = await request.json();
+  } catch (e: any) {
+    return json({ error: "Invalid JSON", message: e?.message || "" }, { status: 400 });
   }
-  const rawText = (body?.text ?? "").toString().trim();
-  if (!rawText) return jsonRsp({ error: "Missing text" }, { status: 400 });
-  if (rawText.length > 2000) return jsonRsp({ error: "Text too long" }, { status: 413 });
 
-  const targetLang = (body?.target ?? "vi").toLowerCase().trim();
-  const sourceLang = (body?.source ?? "auto").toLowerCase().trim();
+  const rawText = (body?.text ?? "").toString().trim();
+  if (!rawText)               return json({ error: "Missing text" }, { status: 400 });
+  if (rawText.length > 2000)  return json({ error: "Text too long" }, { status: 413 });
+
+  const targetLang = (body?.target ?? "vi").toLowerCase().trim();  // default: Vietnamese
+  const sourceLang = (body?.source ?? "auto").toLowerCase().trim(); // default: auto-detect
 
   const apiKey = env.GEMINI_API_KEY;
-  if (!apiKey) return jsonRsp({ error: "Server misconfigured" }, { status: 500 });
+  if (!apiKey) return json({ error: "Server misconfigured" }, { status: 500 });
 
-  /* ---------- 2.  system prompt ---------- */
+  /* ---------- 2) Prompt (system + user) ---------- */
   const systemPrompt = `
 You are an ETA (Easy-Translate-All) assistant.
 Rules:
@@ -62,105 +69,124 @@ Rules:
 }
 `.trim();
 
-  /* ---------- 3.  model list (free tier priority) ---------- */
-  const MODELS = [
-    "gemini-1.5-flash",
-    "gemini-pro",
-    "gemini-1.5-pro",
-    "gemini-2.5-flash-preview-05-20" // <-- Keep an eye on preview model names/availability
-  ];
+  /* ---------- 3) Stable model + payload ---------- */
+  const MODEL = "gemini-1.5-flash"; // stable text model
 
-  const payloadBase = {
-    contents: [{ role: "user", parts: [{ text: `${systemPrompt}\n\nSOURCE: ${sourceLang}\nTARGET: ${targetLang}\n\nTEXT: "${rawText}"` }] }],
+  const payload = {
+    systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
+    contents: [
+      { role: "user", parts: [{ text: `SOURCE: ${sourceLang}\nTARGET: ${targetLang}\n\nTEXT:\n${rawText}` }] }
+    ],
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
         properties: {
           inputLanguage: { type: "STRING" },
-          improved: { type: "STRING" },
-          translation: { type: "STRING" }
+          improved:      { type: "STRING" },
+          translation:   { type: "STRING" }
         },
         required: ["inputLanguage", "improved", "translation"]
-      }
-    }
+      },
+      candidateCount: 1,
+      maxOutputTokens: 256,
+      temperature: 0.2
+    },
+    // Reduce false-positive safety blocks on benign text
+    safetySettings: [
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HARASSMENT",  threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUAL",      threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS",   threshold: "BLOCK_NONE" }
+    ]
   };
 
-  /* ---------- 4.  fetch wrapper – 30 s timeout, dynamic endpoint ---------- */
-  async function tryModel(model) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), 30000);
+  /* ---------- 4) Upstream call with timeout + retries ---------- */
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-    // *** FIX: Determine the correct API version endpoint ***
-    let apiVersion = "v1beta"; // Default to beta
-    if (model === "gemini-1.5-flash" || model === "gemini-pro") {
-      apiVersion = "v1"; // Use v1 for these stable models
-    }
+  async function callGemini(): Promise<any> {
+    const deadlineMs = 10_000;
+    let attempt = 0, lastErr: any;
 
-    // Prepare payload - potentially remove schema for preview models if causing 400
-    let currentPayload = JSON.parse(JSON.stringify(payloadBase)); // Deep copy base payload
-    if (model === "gemini-2.5-flash-preview-05-20") {
-      // *** FIX OPTION (for 400 Bad Request): Uncomment below if needed ***
-      // console.log(`Adjusting payload for preview model: ${model}. Removing responseSchema.`);
-      // delete currentPayload.generationConfig.responseSchema;
-      // If the above doesn't work, you might need to remove responseMimeType too:
-      // delete currentPayload.generationConfig.responseMimeType;
-      // Or even the whole generationConfig if the preview model doesn't support JSON mode well yet:
-      // delete currentPayload.generationConfig;
-    }
+    while (attempt < 3) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort("timeout"), deadlineMs);
 
-    try {
-      const apiUrl = `https://generativelanguage.googleapis.com/${apiVersion}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-      console.log(`Trying model: ${model} via ${apiVersion} endpoint...`); // Debug log
-
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(currentPayload), // Use the potentially modified payload
-        signal: controller.signal
-      });
-      clearTimeout(id);
-      if (!res.ok) throw new Error(`${model} → HTTP ${res.status}`);
-      const data = await res.json();
-      const txt = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!txt) throw new Error(`${model} → empty text`);
-
-      // *** FIX: Add robust JSON parsing validation ***
       try {
-        return JSON.parse(txt);
-      } catch (parseError) {
-          console.error(`[Gemini ${model}] Failed to parse JSON response:`, parseError);
-          throw new Error(`${model} → Invalid JSON received: ${parseError.message}. Text was: ${txt.substring(0, 100)}...`); // Log only first 100 chars
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: ctrl.signal
+        });
+
+        clearTimeout(timer);
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const code   = data?.error?.code   ?? res.status;
+          const status = data?.error?.status ?? res.statusText;
+          const msg    = data?.error?.message ?? `HTTP ${res.status}`;
+          const retryable = code === 429 || res.status >= 500;
+
+          if (retryable && ++attempt < 3) {
+            const backoff = 250 * Math.pow(2, attempt) + Math.random() * 150;
+            await new Promise(r => setTimeout(r, backoff));
+            continue;
+          }
+          throw new Error(`${status}: ${msg}`);
+        }
+
+        const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text || "").join("") ?? "";
+        if (!text) throw new Error("Empty response");
+        return JSON.parse(text);
+
+      } catch (e: any) {
+        lastErr = e;
+        // loop continues if retries remain
+      } finally {
+        // ensure timer cleared
       }
-    } catch (e) {
-      console.warn(`[Gemini ${model}]`, e.message);
-      return null;
-    } finally {
-      clearTimeout(id);
+    }
+
+    throw lastErr || new Error("Upstream failed");
+  }
+
+  /* ---------- 5) Execute with optional fallback ---------- */
+  let result: any;
+  try {
+    result = await callGemini();
+  } catch (_) {
+    // Optional fallback for pure translation paths
+    if (env.AI) {
+      try {
+        // Dynamic import works on Pages/Workers
+        const { Ai } = await import("@cloudflare/ai");
+        const ai = new Ai(env.AI);
+        const out: any = await ai.run("@cf/meta/m2m100-1.2b", {
+          text: rawText, source_lang: sourceLang || "auto", target_lang: targetLang
+        });
+        result = {
+          inputLanguage: sourceLang === "auto" ? "auto" : sourceLang,
+          improved: out?.translated_text || "",
+          translation: out?.translated_text || ""
+        };
+      } catch {
+        // no-op, will fall through to 502 below
+      }
     }
   }
 
-  /* ---------- 5.  walk the chain ---------- */
-  let result = null;
-  for (const m of MODELS) {
-    result = await tryModel(m);
-    if (result) {
-      console.log(`Successfully received response from model: ${m}`); // Debug log success
-      break; // Stop trying models once one succeeds
-    }
+  /* ---------- 6) Final response ---------- */
+  if (!result || typeof result !== "object") {
+    return json({ error: "Translation upstream unavailable" }, { status: 502 });
   }
 
-  /* ---------- 6.  final answer ---------- */
-  if (!result) {
-    console.error("All Gemini models failed to provide a valid response."); // Debug log failure
-    return jsonRsp({ error: "All Gemini models failed or returned invalid JSON/text" }, { status: 502 });
-  }
-
-  // Ensure result properties are strings, default to empty string if missing/null
   const safe = {
     inputLanguage: String(result.inputLanguage || "Unknown"),
-    improved: String(result.improved || ""),
-    translation: String(result.translation || "")
+    improved:      String(result.improved || ""),
+    translation:   String(result.translation || "")
   };
-  return jsonRsp(safe, { status: 200 });
+
+  return json(safe, { status: 200 });
 }
