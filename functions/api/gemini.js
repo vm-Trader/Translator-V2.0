@@ -1,6 +1,10 @@
 // ========================================================================
-//  Cloudflare Pages Function – Gemini ETA Translator
-//  Stable, fast, and copy-paste ready (zero noisy logs)
+//  Cloudflare Pages Function – Gemini ETA Translator (JS build-safe)
+//  - v1 endpoint + gemini-2.5-flash (stable)
+//  - strict JSON schema output
+//  - 10s timeout + bounded retries (429/5xx)
+//  - tight CORS for your Pages domain(s)
+//  - zero external imports
 // ========================================================================
 export async function onRequestPost({ request, env }) {
   /* ---------- 0) CORS + method guard ---------- */
@@ -8,9 +12,9 @@ export async function onRequestPost({ request, env }) {
   const host   = request.headers.get("Host")   || "";
 
   const allowedOrigins = [
-    `https://${host}`,
-    "https://translator-v2-0.pages.dev",
-    /\.translator-v2-0\.pages\.dev$/ // subdomains
+    `https://${host}`,                         // this deployment
+    "https://translator-v2-0.pages.dev",      // prod
+    /\.translator-v2-0\.pages\.dev$/          // preview subdomains
   ];
   const allowOrigin = allowedOrigins.some((o) =>
     typeof o === "string" ? o === origin : o.test(origin)
@@ -22,9 +26,9 @@ export async function onRequestPost({ request, env }) {
     "Access-Control-Allow-Headers": "Content-Type",
     "Vary": "Origin"
   };
-  const json = (body: any, init: any = {}) =>
+  const json = (body, init) =>
     new Response(JSON.stringify(body), {
-      ...init,
+      ...(init || {}),
       headers: { "Content-Type": "application/json", ...corsHeaders }
     });
 
@@ -35,19 +39,19 @@ export async function onRequestPost({ request, env }) {
   const ct = (request.headers.get("Content-Type") || "").toLowerCase();
   if (!ct.includes("application/json")) return json({ error: "Unsupported Media Type" }, { status: 415 });
 
-  let body: any;
+  let body;
   try {
     body = await request.json();
-  } catch (e: any) {
-    return json({ error: "Invalid JSON", message: e?.message || "" }, { status: 400 });
+  } catch (e) {
+    return json({ error: "Invalid JSON", message: e && e.message ? e.message : "" }, { status: 400 });
   }
 
-  const rawText = (body?.text ?? "").toString().trim();
-  if (!rawText)               return json({ error: "Missing text" }, { status: 400 });
-  if (rawText.length > 2000)  return json({ error: "Text too long" }, { status: 413 });
+  const rawText = (body && body.text ? String(body.text) : "").trim();
+  if (!rawText)              return json({ error: "Missing text" }, { status: 400 });
+  if (rawText.length > 2000) return json({ error: "Text too long" }, { status: 413 });
 
-  const targetLang = (body?.target ?? "vi").toLowerCase().trim();  // default: Vietnamese
-  const sourceLang = (body?.source ?? "auto").toLowerCase().trim(); // default: auto-detect
+  const targetLang = (body && body.target ? String(body.target) : "vi").toLowerCase().trim();
+  const sourceLang = (body && body.source ? String(body.source) : "auto").toLowerCase().trim();
 
   const apiKey = env.GEMINI_API_KEY;
   if (!apiKey) return json({ error: "Server misconfigured" }, { status: 500 });
@@ -69,8 +73,9 @@ Rules:
 }
 `.trim();
 
-  /* ---------- 3) Stable model + payload ---------- */
-  const MODEL = "gemini-1.5-flash"; // stable text model
+  /* ---------- 3) Stable model + payload (v1) ---------- */
+  const MODEL = "gemini-2.5-flash"; // current stable name under v1
+  const endpoint = `https://generativelanguage.googleapis.com/v1/models/${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const payload = {
     systemInstruction: { role: "system", parts: [{ text: systemPrompt }] },
@@ -102,14 +107,12 @@ Rules:
   };
 
   /* ---------- 4) Upstream call with timeout + retries ---------- */
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  async function callGemini(): Promise<any> {
+  async function callGemini() {
     const deadlineMs = 10_000;
-    let attempt = 0, lastErr: any;
+    let attempt = 0, lastErr;
 
     while (attempt < 3) {
-      const ctrl = new AbortController();
+      const ctrl  = new AbortController();
       const timer = setTimeout(() => ctrl.abort("timeout"), deadlineMs);
 
       try {
@@ -121,72 +124,52 @@ Rules:
         });
 
         clearTimeout(timer);
-        const data = await res.json().catch(() => ({}));
+
+        let data = {};
+        try { data = await res.json(); } catch (_) {}
 
         if (!res.ok) {
-          const code   = data?.error?.code   ?? res.status;
-          const status = data?.error?.status ?? res.statusText;
-          const msg    = data?.error?.message ?? `HTTP ${res.status}`;
+          const code = (data && data.error && data.error.code) || res.status;
+          const msg  = (data && data.error && data.error.message) || `HTTP ${res.status}`;
           const retryable = code === 429 || res.status >= 500;
-
           if (retryable && ++attempt < 3) {
             const backoff = 250 * Math.pow(2, attempt) + Math.random() * 150;
             await new Promise(r => setTimeout(r, backoff));
             continue;
           }
-          throw new Error(`${status}: ${msg}`);
+          throw new Error(msg);
         }
 
-        const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text || "").join("") ?? "";
+        const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts || [];
+        const text = parts.map(p => (p && p.text) ? p.text : "").join("");
         if (!text) throw new Error("Empty response");
         return JSON.parse(text);
 
-      } catch (e: any) {
+      } catch (e) {
         lastErr = e;
-        // loop continues if retries remain
-      } finally {
-        // ensure timer cleared
+        // continue loop if retries remain
       }
     }
 
     throw lastErr || new Error("Upstream failed");
   }
 
-  /* ---------- 5) Execute with optional fallback ---------- */
-  let result: any;
+  /* ---------- 5) Execute ---------- */
+  let result;
   try {
     result = await callGemini();
   } catch (_) {
-    // Optional fallback for pure translation paths
-    if (env.AI) {
-      try {
-        // Dynamic import works on Pages/Workers
-        const { Ai } = await import("@cloudflare/ai");
-        const ai = new Ai(env.AI);
-        const out: any = await ai.run("@cf/meta/m2m100-1.2b", {
-          text: rawText, source_lang: sourceLang || "auto", target_lang: targetLang
-        });
-        result = {
-          inputLanguage: sourceLang === "auto" ? "auto" : sourceLang,
-          improved: out?.translated_text || "",
-          translation: out?.translated_text || ""
-        };
-      } catch {
-        // no-op, will fall through to 502 below
-      }
-    }
+    // No fallback here to keep build dependency-free
   }
 
-  /* ---------- 6) Final response ---------- */
+  /* ---------- 6) Final ---------- */
   if (!result || typeof result !== "object") {
     return json({ error: "Translation upstream unavailable" }, { status: 502 });
   }
 
-  const safe = {
+  return json({
     inputLanguage: String(result.inputLanguage || "Unknown"),
     improved:      String(result.improved || ""),
     translation:   String(result.translation || "")
-  };
-
-  return json(safe, { status: 200 });
+  }, { status: 200 });
 }
